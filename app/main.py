@@ -27,6 +27,7 @@ class ControlBody(BaseModel):
     unload_delay: float | None = Field(default=None, ge=0, le=60)
     ack_delay: float | None = Field(default=None, ge=0, le=60)
     load_fail: bool | None = None
+    gate_load: bool | None = None
 
 
 async def _poll_loop() -> None:
@@ -102,6 +103,12 @@ async def retry_deployment(dep_id: str):
 @app.post("/api/deployments/{dep_id}/reconcile")
 async def reconcile(dep_id: str):
     return await service.reconcile(dep_id)
+
+
+@app.post("/api/deployments/{dep_id}/revoke")
+async def revoke(dep_id: str):
+    """显式撤销当前 epoch 未终结副本：先建节点撤销栅栏，确认无占用后才释放显存。"""
+    return await service.revoke_deployment(dep_id)
 
 
 @app.get("/api/events")

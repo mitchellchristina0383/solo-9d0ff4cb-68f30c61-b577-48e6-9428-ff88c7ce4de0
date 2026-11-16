@@ -25,6 +25,9 @@ class ControlBody(BaseModel):
     unload_delay: float | None = Field(None, ge=0, le=60)
     ack_delay: float | None = Field(None, ge=0, le=60)
     load_fail: bool | None = None
+    # 挂起加载请求：开启后 /load 在写入副本记录前被挂起，
+    # 用于确定性复现“请求尚未到节点/在途”的加载-对账交错
+    gate_load: bool | None = None
 
 
 def create_app(
@@ -37,14 +40,18 @@ def create_app(
 ) -> FastAPI:
     app = FastAPI(title=f"节点模拟器 {node_id}")
 
-    # rid -> {model, mem_mb, epoch, status: loading|loaded|unloaded|failed}
+    # rid -> {model, mem_mb, epoch, status: loading|loaded|unloaded|failed|fenced}
     replicas: Dict[str, Dict[str, Any]] = {}
+    # rid -> epoch：已被调度器撤销（unload）的加载栅栏。
+    # 一旦建立，同一 (rid, epoch) 的迟到加载请求必须被拒绝，防止“先撤销后生效”。
+    fences: Dict[str, int] = {}
     control: Dict[str, Any] = {
         "mode": "normal",
         "load_delay": default_load_delay,
         "unload_delay": default_unload_delay,
         "ack_delay": 0.0,
         "load_fail": False,
+        "gate_load": False,
     }
     tasks: set[asyncio.Task] = set()
 
@@ -118,6 +125,20 @@ def create_app(
         if not rid:
             return JSONResponse({"detail": "缺少 replica 参数"}, status_code=400)
 
+        # 撤销栅栏优先：调度器已对该 (rid, epoch) 下发过 unload，
+        # 任何迟到的同 epoch 加载都不得再生效（防止旧请求随后占用显存）。
+        if fences.get(rid) == epoch:
+            return JSONResponse(
+                {"detail": f"副本 {rid} epoch={epoch} 已被撤销，迟到加载被拒绝",
+                 "replica": rid, "epoch": epoch, "status": "fenced"},
+                status_code=409,
+            )
+
+        # 在途挂起点：挂起期间请求尚未在节点产生任何副本记录，
+        # 调度器对账只会查询到 unknown（请求可能稍后才生效）。
+        while control["gate_load"]:
+            await asyncio.sleep(0.05)
+
         if control["load_fail"]:
             replicas[rid] = {
                 "model": model_name, "mem_mb": mem_mb, "epoch": epoch, "status": "failed",
@@ -145,9 +166,13 @@ def create_app(
     async def unload(model_name: str, request: Request):
         rid = request.query_params.get("replica")
         epoch = int(request.query_params.get("epoch", "1"))
+        # 幂等撤销栅栏：无论节点上是否已存在该副本，先登记撤销意图，
+        # 此后同 epoch 的迟到加载一律拒绝；节点确认无占用即等价于“未占用”。
+        fences[rid] = epoch
         rec = replicas.get(rid)
         if not rec or rec["epoch"] != epoch:
-            # 节点已无该 epoch 的记录（重启/已释放），对账时可直接视为不存在
+            # 节点已无该 epoch 的记录（加载从未到达/重启/已释放），
+            # 栅栏已建立，调度器查询可直接视为不存在并安全释放预留
             return {"replica": rid, "epoch": epoch, "status": "unknown"}
         if rec["status"] in ("loaded", "loading"):
             rec["status"] = "unloading"
@@ -162,6 +187,11 @@ def create_app(
     async def query_replica(rid: str, epoch: int = 1):
         rec = replicas.get(rid)
         if not rec or rec["epoch"] != epoch:
+            # 栅栏已建立且无在途记录时，明确上报 fenced，便于调度器确认撤销
+            if fences.get(rid) == epoch:
+                return JSONResponse(
+                    {"replica": rid, "epoch": epoch, "status": "fenced"}, status_code=200
+                )
             return JSONResponse(
                 {"replica": rid, "epoch": epoch, "status": "unknown"}, status_code=404
             )
@@ -169,7 +199,8 @@ def create_app(
 
     @app.get("/state")
     async def full_state():
-        return {"node_id": node_id, "control": control, "replicas": replicas}
+        return {"node_id": node_id, "control": control,
+                "replicas": replicas, "fences": fences}
 
     @app.post("/control")
     async def set_control(body: ControlBody):
@@ -180,17 +211,20 @@ def create_app(
     @app.post("/reset")
     async def reset():
         replicas.clear()
+        fences.clear()
         control.update(
             mode="normal",
             load_delay=default_load_delay,
             unload_delay=default_unload_delay,
             ack_delay=0.0,
             load_fail=False,
+            gate_load=False,
         )
         return {"node_id": node_id, "reset": True}
 
     # 暴露内部句柄，供测试直接检查/重置
     app.state.replicas = replicas
+    app.state.fences = fences
     app.state.control = control
     return app
 

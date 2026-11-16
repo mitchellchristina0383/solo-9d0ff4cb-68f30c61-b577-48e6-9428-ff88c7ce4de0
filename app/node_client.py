@@ -22,6 +22,7 @@ class CallResult:
     error: str = ""
     timed_out: bool = False
     connect_error: bool = False  # 传输层问题：节点状态未知，必须保留占用
+    fenced: bool = False         # 节点撤销栅栏命中：迟到加载被明确拒绝，确认未占用
 
     @property
     def transport_failed(self) -> bool:
@@ -75,7 +76,13 @@ async def load(base_url: str, model_name: str, replica_id: str, epoch: int, mem_
             return CallResult(True, r.status_code, r.json())
         detail = ""
         try:
-            detail = r.json().get("detail", "")
+            payload = r.json()
+            detail = payload.get("detail", "")
+            if r.status_code == 409 and payload.get("status") == "fenced":
+                # 节点撤销栅栏命中：该 epoch 已被 unload，迟到加载未占用显存
+                return CallResult(False, r.status_code, data=payload,
+                                  fenced=True,
+                                  error=f"迟到加载被撤销栅栏拒绝: {detail}")
         except Exception:
             detail = r.text[:200]
         # 节点明确拒绝：确认未占用其显存

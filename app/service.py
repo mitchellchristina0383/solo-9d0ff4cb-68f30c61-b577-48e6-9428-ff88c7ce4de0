@@ -276,6 +276,12 @@ async def _load_replica(rid: str) -> None:
         if result.ok:
             log_event(conn, "LOAD_ACK", f"{node.name} 受理加载，等待确认", dep["id"], rid, node.node_id)
             mark_node_online(node.node_id)
+        elif result.fenced:
+            # 撤销栅栏命中：本 epoch 已被撤销，节点明确不会占用，安全释放预留
+            _set_replica(conn, rid, models.REP_LOAD_FAILED,
+                         error=result.error, released=True)
+            log_event(conn, "LOAD_FENCED", result.error, dep["id"], rid, node.node_id)
+            _evaluate(conn, dep["id"])
         elif result.transport_failed:
             _set_replica(conn, rid, models.REP_TIMEOUT, error=result.error)
             log_event(conn, "LOAD_TIMEOUT", result.error, dep["id"], rid, node.node_id)
@@ -316,6 +322,13 @@ async def poll_loading() -> None:
                     _evaluate(conn, dep["id"])
                 # 未超时则继续等待，维持 LOADING 与预留
                 continue
+            if not result.ok:
+                # 显式 HTTP 失败（如 503）不等于“节点确认无副本”，状态仍不可知，
+                # 维持 LOADING/预留继续待核，绝不据此释放
+                conn.execute("UPDATE replicas SET last_error=?,updated_at=? WHERE id=?",
+                             (f"节点暂不可查询（{result.error}），保留占用待核",
+                              now(), rep["id"]))
+                continue
             if remote == "loaded":
                 _set_replica(conn, rep["id"], models.REP_LOADED, confirmed=True)
                 log_event(conn, "LOAD_CONFIRMED", f"{node.name} 确认加载完成",
@@ -327,13 +340,19 @@ async def poll_loading() -> None:
                 log_event(conn, "LOAD_FAIL", "节点上报加载失败", dep["id"], rep["id"], node.node_id)
                 _evaluate(conn, dep["id"])
             elif remote == "unknown":
-                # 节点明确不存在该副本，远端不占显存，本侧预留可释放
-                _set_replica(conn, rep["id"], models.REP_LOAD_FAILED,
-                             error="对账发现节点上无此副本（加载未生效）", released=True)
-                log_event(conn, "LOAD_MISSING", "节点上无此副本，释放预留",
+                # 关键修复：请求可能仍在途、尚未到节点，查无副本不等于加载未生效。
+                # 保留显存占用转待核（UNVERIFIED），由后续对账确认或人工撤销，
+                # 绝不在此处释放，避免晚到加载与新部署重复占用同一显存。
+                _set_replica(
+                    conn, rep["id"], models.REP_UNVERIFIED,
+                    error="对账查询暂无副本：加载请求可能仍在途，保留占用待核，"
+                          "节点恢复后再次对账；确认放弃请执行撤销",
+                )
+                log_event(conn, "LOAD_UNVERIFIED",
+                          "查询无副本但加载仍可能生效，保持占用转待核",
                           dep["id"], rep["id"], node.node_id)
                 _evaluate(conn, dep["id"])
-            else:  # loading / unloading：仍在途
+            else:  # loading / unloading / fenced：仍在途或已撤销，继续观察
                 if waited >= config.LOAD_TIMEOUT:
                     _set_replica(conn, rep["id"], models.REP_TIMEOUT,
                                  error=f"加载超过 {config.LOAD_TIMEOUT:.0f}s 未确认，保留占用待核")
@@ -344,7 +363,13 @@ async def poll_loading() -> None:
 
 # ---------------------------------------------------------------- 释放/对账
 async def request_release(rid: str, reason: str) -> None:
-    """将待核副本转入释放中，并向节点撤销旧加载（幂等，可重复调用）。"""
+    """将副本转入释放中并向节点撤销加载（幂等，可重复调用）。
+
+    语义保证：
+    - 先在节点建立撤销栅栏（unload），使同 epoch 的迟到加载无法再生效；
+    - 仅当节点明确受理（非传输层失败）才记录 revoke_fenced_at；
+    - 传输超时/失联时结果未确认，保持 RELEASING 与显存占用，继续待核。
+    """
     rep = db.query_one("SELECT * FROM replicas WHERE id=?", (rid,))
     if not rep or rep["status"] in (models.REP_RELEASED, models.REP_LOAD_FAILED):
         return
@@ -354,7 +379,7 @@ async def request_release(rid: str, reason: str) -> None:
     with db.tx() as conn:
         if rep["status"] != models.REP_RELEASING:
             _set_replica(conn, rid, models.REP_RELEASING, error=reason)
-            log_event(conn, "RELEASE_SEND", f"请求 {node.name} 撤销旧加载：{reason}",
+            log_event(conn, "RELEASE_SEND", f"请求 {node.name} 撤销加载：{reason}",
                       dep["id"], rid, node.node_id)
             _evaluate(conn, dep["id"])
 
@@ -364,14 +389,26 @@ async def request_release(rid: str, reason: str) -> None:
         if cur["status"] != models.REP_RELEASING:
             return
         if result.transport_failed:
-            conn.execute("UPDATE replicas SET last_error=? WHERE id=?",
-                         (f"卸载未确认：{result.error}，保持占用待对账", rid))
+            # 撤销请求可能未到达节点：不建栅栏、不释放，保持占用待下次对账重试
+            conn.execute("UPDATE replicas SET last_error=?,updated_at=? WHERE id=?",
+                         (f"卸载未确认：{result.error}，保持占用待对账", now(), rid))
+            log_event(conn, "RELEASE_UNCONFIRMED",
+                      f"卸载调用未确认，节点结果未知，继续保留占用：{result.error}",
+                      dep["id"], rid, node.node_id)
         else:
-            log_event(conn, "UNLOAD_ACK", "节点受理卸载，等待确认释放", dep["id"], rid, node.node_id)
+            # 节点已受理（含节点上本就无记录的 unknown 应答）：栅栏已建立，
+            # 此后同 epoch 迟到加载会被节点拒绝，再经查询确认即可释放
+            conn.execute(
+                "UPDATE replicas SET revoke_fenced_at=COALESCE(revoke_fenced_at,?),"
+                "last_error=?,updated_at=? WHERE id=?",
+                (now(), f"撤销已受理，等待节点确认无占用：{reason}", now(), rid),
+            )
+            log_event(conn, "UNLOAD_ACK", "节点受理卸载，撤销栅栏已建立，等待确认释放",
+                      dep["id"], rid, node.node_id)
 
 
 async def poll_releasing() -> None:
-    """轮询释放中的副本，只有节点确认不存在/已卸载才标记 RELEASED。"""
+    """轮询释放中的副本：必须撤销栅栏已建立且节点确认无占用，才标记 RELEASED。"""
     reps = db.query(
         "SELECT * FROM replicas WHERE status=?", (models.REP_RELEASING,)
     )
@@ -387,24 +424,48 @@ async def poll_releasing() -> None:
                 conn.execute("UPDATE replicas SET last_error=?,updated_at=? WHERE id=?",
                              (f"节点失联无法对账：{result.error}，继续保留占用", now(), rep["id"]))
                 continue
+            if not result.ok:
+                # 显式 HTTP 失败同样不能证明节点无占用，继续待核
+                conn.execute("UPDATE replicas SET last_error=?,updated_at=? WHERE id=?",
+                             (f"节点暂不可查询（{result.error}），继续保留占用", now(), rep["id"]))
+                continue
             remote = (result.data or {}).get("status")
-            if remote in ("unknown", "unloaded"):
+            if not cur["revoke_fenced_at"]:
+                # 栅栏尚未建立（上次 unload 未确认）：即使查询为 unknown 也不能释放，
+                # 因为迟到加载仍可能随后生效；本轮先补发撤销
+                log_event(conn, "RELEASE_PENDING_FENCE",
+                          f"撤销栅栏未建立前查询结果 {remote} 不可作为释放依据，补发卸载",
+                          dep["id"], rep["id"], node.node_id)
+                need_unload = True
+            elif remote in ("unknown", "unloaded", "fenced"):
                 _set_replica(conn, rep["id"], models.REP_RELEASED,
-                             error="节点对账确认已释放", released=True)
-                log_event(conn, "RELEASE_CONFIRMED", "对账确认显存已释放，可重新分配",
+                             error="节点对账确认已释放（撤销栅栏已生效）", released=True)
+                log_event(conn, "RELEASE_CONFIRMED",
+                          f"对账确认显存已释放(remote={remote})，可重新分配",
                           dep["id"], rep["id"], node.node_id)
                 _evaluate(conn, dep["id"])
+                need_unload = False
             else:
                 # loaded/loading/unloading：旧加载仍在，重新撤销
                 log_event(conn, "RELEASE_STILL_HELD",
                           f"节点仍持有副本(remote={remote})，重新下发卸载",
                           dep["id"], rep["id"], node.node_id)
-        if result.ok and (result.data or {}).get("status") not in ("unknown", "unloaded"):
-            await node_client.unload(node.base_url, dep["model_name"], rep["id"], rep["epoch"])
+                need_unload = True
+        if need_unload:
+            # 走统一撤销入口：受理后会登记 revoke_fenced_at，避免重复补发
+            await request_release(rep["id"], "轮询发现仍占用/栅栏未建立，补发撤销")
 
 
 async def reconcile(dep_id: str) -> dict:
-    """对账：逐副本向节点核实真实状态，处置超时/失联后的残留占用。"""
+    """对账：逐副本向节点核实真实状态。
+
+    核心原则（加载与对账交错安全）：
+    - 只要加载请求仍可能生效（未显式撤销），查无副本一律保持占用、转待核并提示，
+      绝不判失败、绝不释放显存；
+    - 晚到但未撤销的加载若已在节点生效（loaded），同一 epoch 内合法补确认；
+    - 只有显式撤销（RELEASING 且栅栏已建立）后，节点确认无占用才允许释放；
+    - 传输超时/失联、显式查询失败等结果未确认场景，全部继续待核。
+    """
     dep = db.query_one("SELECT * FROM deployments WHERE id=?", (dep_id,))
     if not dep:
         raise HTTPException(404, "部署不存在")
@@ -422,20 +483,40 @@ async def reconcile(dep_id: str) -> dict:
         with db.tx() as conn:
             cur = conn.execute("SELECT * FROM replicas WHERE id=?", (rep["id"],)).fetchone()
             if result.transport_failed:
-                note = f"{node.name} 仍失联/不可达（{result.error}），副本 {cur['id']} 保持{models.REP_STATUS_CN[cur['status']]}并继续占用"
+                note = (f"{node.name} 仍失联/不可达（{result.error}），副本 {cur['id']} "
+                        f"保持{models.REP_STATUS_CN[cur['status']]}并继续占用，待恢复后再核")
+                notes.append(note)
+                log_event(conn, "RECONCILE_BLOCKED", note, dep_id, cur["id"], node.node_id)
+                continue
+            if not result.ok:
+                # 显式 HTTP 失败（如 503）不代表节点确认无副本，保持待核
+                note = (f"{node.name} 暂不可查询（{result.error}），副本 "
+                        f"{cur['id']} 保持{models.REP_STATUS_CN[cur['status']]}并继续占用")
                 notes.append(note)
                 log_event(conn, "RECONCILE_BLOCKED", note, dep_id, cur["id"], node.node_id)
                 continue
             remote = (result.data or {}).get("status")
             st = cur["status"]
+            # 不变量：撤销栅栏一旦建立，副本只能沿 RELEASING -> RELEASED 前进，
+            # 任何查询结果都不得把它退回待核/加载类状态（防止轮询与对账交错丢路径）
+            if cur["revoke_fenced_at"] and st != models.REP_RELEASING:
+                conn.execute(
+                    "UPDATE replicas SET status=?,last_error=?,updated_at=? WHERE id=?",
+                    (models.REP_RELEASING,
+                     "撤销栅栏已建立，纠正回释放中流程", now(), cur["id"]),
+                )
+                st = models.REP_RELEASING
+                cur = conn.execute("SELECT * FROM replicas WHERE id=?", (cur["id"],)).fetchone()
             if remote == "loaded":
                 mark_node_online(node.node_id)
-                if st in (models.REP_LOADING, models.REP_TIMEOUT, models.REP_UNVERIFIED):
-                    # 超时/待核后核实加载其实已成功：同一 epoch 的合法补确认
+                if st in (models.REP_LOADING, models.REP_TIMEOUT,
+                          models.REP_UNVERIFIED, models.REP_PENDING):
+                    # 超时/待核/在途后核实加载其实已成功：同一 epoch 的合法补确认
+                    # （未撤销的晚到加载在此被正确确认，而不是被误判失败）
                     _set_replica(conn, cur["id"], models.REP_LOADED, confirmed=True)
-                    notes.append(f"{node.name} 上副本实际已加载，补确认")
+                    notes.append(f"{node.name} 上副本实际已加载，补确认（晚到加载生效）")
                     log_event(conn, "RECONCILE_LOADED",
-                              "失联/超时后核实加载其实已成功，补确认",
+                              "核实加载其实已成功，同 epoch 补确认",
                               dep_id, cur["id"], node.node_id)
                 elif st == models.REP_RELEASING:
                     notes.append(f"{node.name} 仍持有旧加载，继续撤销")
@@ -443,48 +524,111 @@ async def reconcile(dep_id: str) -> dict:
                               dep_id, cur["id"], node.node_id)
                 else:
                     notes.append(f"{node.name} 上副本正常加载中状态一致")
-            elif remote in ("unknown", "unloaded"):
+            elif remote in ("unknown", "fenced", "unloaded"):
                 mark_node_online(node.node_id)
-                if st in (models.REP_TIMEOUT, models.REP_UNVERIFIED, models.REP_RELEASING):
+                if st == models.REP_RELEASING and cur["revoke_fenced_at"]:
+                    # 唯一允许释放的路径：已显式撤销且栅栏生效，节点确认无占用
                     _set_replica(conn, cur["id"], models.REP_RELEASED,
-                                 error=f"对账确认节点无残留（remote={remote}）", released=True)
-                    notes.append(f"{node.name} 无残留，副本 {cur['id']} 确认释放")
-                    log_event(conn, "RECONCILE_RELEASED", "节点确认无副本，释放显存",
+                                 error=f"撤销后对账确认节点无残留（remote={remote}）",
+                                 released=True)
+                    notes.append(f"{node.name} 确认无残留，副本 {cur['id']} 释放显存")
+                    log_event(conn, "RECONCILE_RELEASED", "撤销生效且节点确认无副本，释放显存",
+                              dep_id, cur["id"], node.node_id)
+                elif st == models.REP_RELEASING:
+                    # 已请求撤销但栅栏尚未确认建立：不能释放，保持 RELEASING 补发撤销，
+                    # 绝不退回 UNVERIFIED（否则将永远无法走到释放路径）
+                    notes.append(f"{node.name} 查询为 {remote}，但撤销尚未被节点确认，"
+                                 "保持释放中并补发卸载")
+                    log_event(conn, "RECONCILE_PENDING_FENCE",
+                              "释放前必须确认撤销栅栏建立，保持 RELEASING",
                               dep_id, cur["id"], node.node_id)
                 elif st == models.REP_LOADED:
-                    # 账本认为已加载，节点却没有——不一致，先待核再释放
+                    # 账本认为已加载，节点却没有——不一致，先待核，不擅自释放
                     _set_replica(conn, cur["id"], models.REP_UNVERIFIED,
-                                 error="对账不一致：账本为已加载，节点上不存在")
-                    notes.append(f"{node.name} 对账不一致，副本转待核并将撤销")
+                                 error="对账不一致：账本为已加载，节点上不存在，待核")
+                    notes.append(f"{node.name} 对账不一致，副本转待核（显存保留）")
                     log_event(conn, "RECONCILE_MISMATCH", "账本已加载但节点无此副本",
                               dep_id, cur["id"], node.node_id)
-                else:  # PENDING/LOADING
-                    _set_replica(conn, cur["id"], models.REP_LOAD_FAILED,
-                                 error="对账发现节点无此副本，加载未生效", released=True)
-                    notes.append(f"{node.name} 无此副本，判定加载失败")
-                    log_event(conn, "RECONCILE_MISSING", "加载未生效",
+                else:
+                    # PENDING/LOADING/TIMEOUT/UNVERIFIED 且未撤销：
+                    # 加载请求仍可能晚到生效 —— 保持占用，提示待核，绝不判失败释放
+                    if st != models.REP_UNVERIFIED:
+                        _set_replica(
+                            conn, cur["id"], models.REP_UNVERIFIED,
+                            error=f"对账查询无副本(remote={remote})，但加载请求可能仍在途，"
+                                  "保留占用待核；确认放弃请执行撤销",
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE replicas SET last_error=?,updated_at=? WHERE id=?",
+                            (f"对账仍无副本(remote={remote})，加载可能在途，继续保留占用待核",
+                             now(), cur["id"]),
+                        )
+                    notes.append(
+                        f"{node.name} 暂查询不到副本 {cur['id']}，加载请求可能仍在途，"
+                        "显存保持占用、状态待核；晚到加载生效后可补确认，"
+                        "确认放弃请点“撤销”后再对账释放"
+                    )
+                    log_event(conn, "RECONCILE_UNVERIFIED",
+                              "查无副本但加载可能生效，保持占用待核（不释放）",
                               dep_id, cur["id"], node.node_id)
             elif remote == "failed":
-                _set_replica(conn, cur["id"], models.REP_LOAD_FAILED,
-                             error="节点上报 failed", released=True)
-                notes.append(f"{node.name} 上报失败，释放预留")
+                if st == models.REP_RELEASING and cur["revoke_fenced_at"]:
+                    _set_replica(conn, cur["id"], models.REP_RELEASED,
+                                 error="撤销后节点上报 failed，确认无占用", released=True)
+                    notes.append(f"{node.name} 撤销后上报 failed，确认释放")
+                else:
+                    _set_replica(conn, cur["id"], models.REP_UNVERIFIED,
+                                 error="节点上报 failed，状态待核，保留占用")
+                    notes.append(f"{node.name} 上报 failed，副本保持待核占用")
             else:  # loading / unloading
                 if st == models.REP_TIMEOUT:
-                    # 节点仍在加载：给一次确认机会，维持等待，下轮轮询继续核实
                     notes.append(f"{node.name} 上副本仍在 {remote}，维持待核继续观察")
+                elif st == models.REP_RELEASING:
+                    notes.append(f"{node.name} 上副本处于 {remote}，继续等待撤销完成")
                 else:
                     notes.append(f"{node.name} 上副本处于 {remote}，维持 {models.REP_STATUS_CN[st]}")
             _evaluate(conn, dep_id)
 
-    # 对账中新出现的待核/不一致副本，自动发起撤销
+    # 对所有“释放中”副本幂等补发撤销：
+    # - 栅栏未建立的，借此次调用建立栅栏（request_release 幂等，已受理不会重复登记）；
+    # - 栅栏已建立但节点仍持有旧加载的，重新下发卸载直到确认无占用。
+    # UNVERIFIED 代表加载仍可能生效，对账不自动撤销，把决定权留给值班员。
     for rep in db.query(
-        "SELECT * FROM replicas WHERE deployment_id=? AND epoch=? AND status IN (?,?)",
-        (dep_id, dep["epoch"], models.REP_UNVERIFIED, models.REP_RELEASING),
+        "SELECT * FROM replicas WHERE deployment_id=? AND epoch=? AND status=?",
+        (dep_id, dep["epoch"], models.REP_RELEASING),
     ):
-        await request_release(rep["id"], "对账后撤销旧加载")
+        await request_release(rep["id"], "对账补发/重试撤销")
 
     updated = get_deployment(dep_id)
     updated["reconcile_notes"] = notes or ["所有副本与节点状态一致"]
+    return updated
+
+
+async def revoke_deployment(dep_id: str, reason: str = "值班员撤销待核加载") -> dict:
+    """显式撤销当前 epoch 的全部未终结副本。
+
+    只有通过该入口明确表达放弃后，才会向节点建立撤销栅栏；
+    节点确认无占用前显存保持占用（RELEASING 计入预留），确认后才释放。
+    """
+    dep = db.query_one("SELECT * FROM deployments WHERE id=?", (dep_id,))
+    if not dep:
+        raise HTTPException(404, "部署不存在")
+    reps = db.query(
+        "SELECT * FROM replicas WHERE deployment_id=? AND epoch=? ORDER BY seq",
+        (dep_id, dep["epoch"]),
+    )
+    targets = [r for r in reps
+               if r["status"] not in (models.REP_RELEASED, models.REP_LOAD_FAILED)]
+    if not targets:
+        raise HTTPException(409, "当前 epoch 没有可撤销的副本（均已终结）")
+    for rep in targets:
+        await request_release(rep["id"], reason)
+    updated = get_deployment(dep_id)
+    updated["reconcile_notes"] = [
+        f"已向 {len(targets)} 个副本下发撤销；节点确认无占用前显存继续保留，"
+        "确认后自动/手动对账释放"
+    ]
     return updated
 
 

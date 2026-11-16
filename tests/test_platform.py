@@ -56,11 +56,19 @@ async def client():
         os.remove(os.environ["PLATFORM_DB"])
     from app import db as db_mod
     db_mod._conn = None
+    # 节点在线内存态同样在用例间重置，避免失联边沿/自动对账串扰
+    for rt in service.NODE_RUNTIME.values():
+        rt.update(online=None, last_check=None, detail="尚未探测", mode="")
     # ASGI 测试传输下用 0 表示直接抛连接异常；真实 uvicorn 下用长挂起复现超时
     sim_a = simulator.create_app("node-a", "模拟节点A", 8192, 0.3, 0.15,
                                  unreachable_sleep=0)
     sim_b = simulator.create_app("node-b", "模拟节点B", 8192, 0.3, 0.15,
                                  unreachable_sleep=0)
+    # 每个用例使用全新节点实例，杜绝故障模式/副本/栅栏在测试间残留
+    sim_a.state.replicas.clear()
+    sim_a.state.fences.clear()
+    sim_b.state.replicas.clear()
+    sim_b.state.fences.clear()
     transport = RoutingTransport(sim_a, sim_b)
     async with httpx.AsyncClient(base_url="http://platform", transport=transport,
                                  timeout=10) as c:
@@ -207,9 +215,20 @@ async def test_04_unreachable_timeout_keeps_hold_then_reconcile_releases(client)
     # 节点恢复（失联期间请求从未到达模拟器，B 上实际没有该副本）
     await client.post("/api/nodes/node-b/control", json={"mode": "normal"})
     await service.health_monitor_once()  # 触发恢复自动对账
-    dep = await wait_for(client, dep_id, {"AVAILABLE", "FAILED"}, timeout=12)
-    # B 上实际没有副本 -> 对账释放 -> 该副本 LOAD_FAILED/RELEASED，部署 FAILED
-    assert dep["status"] == "FAILED"
+    # 新语义：恢复后对账查无副本，但加载请求理论上仍可能晚到生效，
+    # 必须保持占用、转待核并提示，而不是判失败释放
+    rec = (await client.post(f"/api/deployments/{dep_id}/reconcile")).json()
+    assert rec["status"] == "UNVERIFIED"
+    by_node = {x["node_id"]: x for x in rec["replicas"]}
+    assert by_node["node-b"]["status"] == "UNVERIFIED"
+    assert any("待核" in note or "在途" in note for note in rec["reconcile_notes"])
+    book = (await client.get("/api/nodes")).json()
+    assert next(n for n in book if n["node_id"] == "node-b")["used_mb"] == 1500
+
+    # 值班员确认放弃 -> 显式撤销：节点栅栏建立并确认无占用后才释放
+    rev = (await client.post(f"/api/deployments/{dep_id}/revoke")).json()
+    assert "撤销" in "".join(rev["reconcile_notes"])
+    dep = await wait_for(client, dep_id, {"FAILED"}, timeout=12)
     by_node = {x["node_id"]: x for x in dep["replicas"]}
     assert by_node["node-b"]["status"] in {"RELEASED", "LOAD_FAILED"}
     book = (await client.get("/api/nodes")).json()
@@ -248,7 +267,7 @@ async def test_05_late_ack_must_not_revive_old_replica(client):
     dep = await wait_for(client, dep_id, {"AVAILABLE"}, timeout=8)
     assert dep["replicas"][0]["status"] == "LOADED"
 
-    # 3) 再次失联并人工撤销旧加载，恢复后对账确认释放
+    # 3) 再次失联并人工撤销旧加载；失联期间撤销无法确认，恢复后须先建立栅栏再释放
     await client.post("/api/nodes/node-a/control", json={"mode": "unreachable"})
     from app import models
     import app.db as db_mod
@@ -322,15 +341,16 @@ async def test_07_recovery_revokes_stale_load_then_confirms_release(client):
         service._evaluate(conn, dep_id)
     await service.request_release(rid, "演练：撤销旧加载")
 
-    # 失联中对账不能释放
+    # 失联中对账不能释放，且撤销请求未被节点确认 -> 栅栏未建立、显存继续保留
     rec = (await client.post(f"/api/deployments/{dep_id}/reconcile")).json()
     assert rec["status"] == "UNVERIFIED"
     book = (await client.get("/api/nodes")).json()
     assert node_free(book, "node-b") == 8192 - 2500
-
+    import app.db as db_mod0
+    row0 = db_mod0.query_one("SELECT * FROM replicas WHERE id=?", (rid,))
+    assert row0["revoke_fenced_at"] is None  # 未确认的撤销不得释放显存
     # 恢复：节点上旧加载仍在（loaded），自动/手动对账应撤销并最终确认释放。
-    # 自动对账与手动对账可能由不同轮次触发，终态为 RELEASED（确认释放）或
-    # LOAD_FAILED（对账确认节点无残留）——两者都不再占用显存，语义等价。
+    # 新语义：必须先等节点受理 unload（建立栅栏），再查询确认无占用才允许 RELEASED。
     await client.post("/api/nodes/node-b/control", json={"mode": "normal"})
     await service.health_monitor_once()
     deadline = asyncio.get_event_loop().time() + 15
@@ -345,7 +365,8 @@ async def test_07_recovery_revokes_stale_load_then_confirms_release(client):
         raise AssertionError("恢复后副本未在时限内确认释放")
     dep = (await client.get(f"/api/deployments/{dep_id}")).json()
     b = next(x for x in dep["replicas"] if x["node_id"] == "node-b")
-    assert b["status"] in {"RELEASED", "LOAD_FAILED"}, dep
+    assert b["status"] == "RELEASED", dep  # 经“栅栏+查询确认”路径释放
+    assert b["released_at"] is not None
     book = (await client.get("/api/nodes")).json()
     assert node_free(book, "node-b") == 8192  # 关键：确认释放后显存全额可用
 
@@ -353,3 +374,196 @@ async def test_07_recovery_revokes_stale_load_then_confirms_release(client):
     r2 = await client.post("/api/deployments", json={
         "model_name": "new-tenant", "mem_per_replica_mb": 7000, "replica_count": 1})
     assert r2.status_code == 201, r2.text
+
+
+@pytest.mark.asyncio
+async def test_08_manual_reconcile_while_load_inflight_keeps_hold(client):
+    # 值班场景复现：提交部署后立刻手动对账，加载请求尚未到节点 -> 查无副本。
+    # 正确行为：保持显存占用、提示待核，绝不判失败释放；晚到加载仍可补确认。
+    await client.post("/api/nodes/node-a/control", json={"gate_load": True})
+    r = await client.post("/api/deployments", json={
+        "model_name": "inflight", "mem_per_replica_mb": 3000, "replica_count": 1})
+    dep_id = r.json()["id"]
+
+    # 等待调度器把加载请求挂在节点入口（节点上尚无副本记录）
+    sim_state = client._transport._a.app.state  # type: ignore[attr-defined]
+    deadline = asyncio.get_event_loop().time() + 5
+    while asyncio.get_event_loop().time() < deadline:
+        dep = (await client.get(f"/api/deployments/{dep_id}")).json()
+        if dep["replicas"][0]["status"] == "LOADING":
+            break
+        await asyncio.sleep(0.05)
+    assert dep["replicas"][0]["status"] == "LOADING"
+    assert dep["replicas"][0]["node_id"] == "node-a"
+    # 节点侧确实没有副本记录（请求在途）
+    rid = dep["replicas"][0]["id"]
+    assert rid not in sim_state.replicas
+
+    # 立即手动对账：查无副本，但必须保持占用、转待核
+    rec = (await client.post(f"/api/deployments/{dep_id}/reconcile")).json()
+    assert rec["status"] == "UNVERIFIED", rec
+    rep = rec["replicas"][0]
+    assert rep["status"] == "UNVERIFIED"
+    assert any("待核" in n or "在途" in n for n in rec["reconcile_notes"])
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-a") == 8192 - 3000  # 显存没有被释放
+
+    # 占用期间并发部署不得超额：双副本要求两台节点都放得下，
+    # node-a 仅剩 5192，申请 6000×2 必被拒（node-b 虽空闲也无法完成分散分配）
+    blocked = await client.post("/api/deployments", json={
+        "model_name": "blocker", "mem_per_replica_mb": 6000, "replica_count": 2})
+    assert blocked.status_code == 409
+    # 单节点可容纳的申请仍可成功，且只能落在空闲的 node-b，绝不与待核副本争用 node-a
+    ok = await client.post("/api/deployments", json={
+        "model_name": "elsewhere", "mem_per_replica_mb": 4000, "replica_count": 1})
+    assert ok.status_code == 201, ok.text
+    dep_ok = await wait_for(client, ok.json()["id"], {"AVAILABLE"}, timeout=8)
+    assert dep_ok["replicas"][0]["node_id"] == "node-b"
+
+    # 放行加载请求：晚到加载生效，再次对账应合法补确认 -> AVAILABLE
+    await client.post("/api/nodes/node-a/control", json={"gate_load": False})
+    deadline = asyncio.get_event_loop().time() + 10
+    while asyncio.get_event_loop().time() < deadline:
+        rec = (await client.post(f"/api/deployments/{dep_id}/reconcile")).json()
+        if rec["status"] == "AVAILABLE":
+            break
+        await asyncio.sleep(0.2)
+    assert rec["status"] == "AVAILABLE", rec
+    assert rec["replicas"][0]["status"] == "LOADED"
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-a") == 8192 - 3000
+
+
+@pytest.mark.asyncio
+async def test_09_revoke_fences_late_load_then_releases_only_after_confirmation(client):
+    # 加载在途 + 人工撤销：必须先阻止旧请求随后生效（节点栅栏），
+    # 节点确认无占用后才释放显存；迟到的加载请求被明确拒绝。
+    # 先用单副本小部署占据 node-a，使目标部署确定性落到 node-b
+    seat = (await client.post("/api/deployments", json={
+        "model_name": "seat", "mem_per_replica_mb": 100, "replica_count": 1})).json()
+    await wait_for(client, seat["id"], {"AVAILABLE"}, timeout=8)
+    await client.post("/api/nodes/node-b/control", json={"gate_load": True})
+    r = await client.post("/api/deployments", json={
+        "model_name": "revoke-me", "mem_per_replica_mb": 2200, "replica_count": 1})
+    dep_id = r.json()["id"]
+    dep = await wait_for(client, dep_id, {"PENDING", "UNVERIFIED"}, timeout=6)
+    rid = dep["replicas"][0]["id"]
+    assert dep["replicas"][0]["node_id"] == "node-b"
+    sim_b = client._transport._b.app.state  # type: ignore[attr-defined]
+
+    # 先对账转待核（请求仍挂起），保持占用
+    rec = (await client.post(f"/api/deployments/{dep_id}/reconcile")).json()
+    assert rec["replicas"][0]["status"] == "UNVERIFIED"
+
+    # 显式撤销：unload 先在节点建立栅栏
+    rev = (await client.post(f"/api/deployments/{dep_id}/revoke")).json()
+    assert rev["replicas"][0]["status"] == "RELEASING"
+    import app.db as db_mod
+    row = db_mod.query_one("SELECT * FROM replicas WHERE id=?", (rid,))
+    assert row["revoke_fenced_at"] is not None  # 节点已受理撤销
+    assert sim_b.fences.get(rid) == row["epoch"]
+    # 撤销受理但尚未完成查询确认前，显存仍保留占用
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-b") == 8192 - 2200
+
+    # 放行挂起的加载请求：必须被栅栏拒绝（409 fenced），节点不产生占用
+    await client.post("/api/nodes/node-b/control", json={"gate_load": False})
+    deadline = asyncio.get_event_loop().time() + 10
+    while asyncio.get_event_loop().time() < deadline:
+        dep = (await client.get(f"/api/deployments/{dep_id}")).json()
+        if dep["replicas"][0]["status"] in {"RELEASED", "LOAD_FAILED"}:
+            break
+        await client.post(f"/api/deployments/{dep_id}/reconcile")
+        await asyncio.sleep(0.2)
+    dep = (await client.get(f"/api/deployments/{dep_id}")).json()
+    assert dep["replicas"][0]["status"] == "RELEASED", dep
+    # 节点侧没有同 epoch 的加载记录，栅栏仍在
+    assert rid not in sim_b.replicas or sim_b.replicas[rid]["status"] != "loaded"
+    assert sim_b.fences.get(rid) == dep["replicas"][0]["epoch"]
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-b") == 8192  # 确认无占用后才释放
+
+    # 显存释放后新部署可以使用同一空间
+    r2 = await client.post("/api/deployments", json={
+        "model_name": "after-release", "mem_per_replica_mb": 7000, "replica_count": 1})
+    assert r2.status_code == 201, r2.text
+
+
+@pytest.mark.asyncio
+async def test_10_revoke_while_node_lost_stays_held_until_node_confirms(client):
+    # 撤销尝试时节点失联：撤销结果未确认 -> 绝不释放；
+    # 恢复后补发撤销、确认无占用才释放（含加载超时语义）。
+    await client.post("/api/nodes/node-a/control", json={"mode": "unreachable"})
+    r = await client.post("/api/deployments", json={
+        "model_name": "ghost-revoke", "mem_per_replica_mb": 1800, "replica_count": 1})
+    dep_id = r.json()["id"]
+    dep = await wait_for(client, dep_id, {"UNVERIFIED"}, timeout=10)
+    rid = dep["replicas"][0]["id"]
+    assert dep["replicas"][0]["status"] in {"TIMEOUT", "UNVERIFIED"}
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-a") == 8192 - 1800
+
+    # 失联下撤销：调用无法确认，栅栏不得建立、显存继续保留
+    await client.post(f"/api/deployments/{dep_id}/revoke")
+    import app.db as db_mod
+    await asyncio.sleep(0.3)
+    row = db_mod.query_one("SELECT * FROM replicas WHERE id=?", (rid,))
+    assert row["status"] == "RELEASING" and row["revoke_fenced_at"] is None
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-a") == 8192 - 1800  # 未确认绝不释放
+
+    # 失联期间反复对账也不能释放
+    rec = (await client.post(f"/api/deployments/{dep_id}/reconcile")).json()
+    assert rec["status"] == "UNVERIFIED"
+    assert any("失联" in n or "不可达" in n for n in rec["reconcile_notes"])
+
+    # 恢复（加载从未到达，节点无记录）：补发撤销建立栅栏 -> 查询确认 -> 释放
+    await client.post("/api/nodes/node-a/control", json={"mode": "normal"})
+    await service.health_monitor_once()
+    deadline = asyncio.get_event_loop().time() + 12
+    while asyncio.get_event_loop().time() < deadline:
+        await client.post(f"/api/deployments/{dep_id}/reconcile")
+        dep = (await client.get(f"/api/deployments/{dep_id}")).json()
+        if dep["replicas"][0]["status"] in {"RELEASED", "LOAD_FAILED"}:
+            break
+        await asyncio.sleep(0.2)
+    dep = (await client.get(f"/api/deployments/{dep_id}")).json()
+    assert dep["replicas"][0]["status"] == "RELEASED", dep
+    book = (await client.get("/api/nodes")).json()
+    assert node_free(book, "node-a") == 8192
+
+
+@pytest.mark.asyncio
+async def test_11_concurrent_deploys_never_overcommit_while_replicas_pending(client):
+    # 在“查无副本、保持待核”的窗口内并发提交部署，账本仍不得超额
+    await client.post("/api/nodes/node-a/control", json={"gate_load": True})
+    await client.post("/api/nodes/node-b/control", json={"gate_load": True})
+
+    async def submit(i):
+        return await client.post("/api/deployments", json={
+            "model_name": f"race{i}", "mem_per_replica_mb": 4000, "replica_count": 2})
+
+    results = await asyncio.gather(*(submit(i) for i in range(3)))
+    codes = sorted(r.status_code for r in results)
+    assert codes == [201, 201, 409], codes
+
+    # 全部副本仍卡在在途/待核，但预留已记账：每节点恰好 2×4000
+    book = (await client.get("/api/nodes")).json()
+    for n in book:
+        assert n["used_mb"] == 8000 and n["free_mb"] == 192, n
+    # 待核窗口内再提交仍被拒（剩余 192MB，3000MB 副本无处安放）
+    again = await client.post("/api/deployments", json={
+        "model_name": "one-more", "mem_per_replica_mb": 3000, "replica_count": 1})
+    assert again.status_code == 409
+
+    # 放行后全部正常加载，占用不变、无重复占用
+    await client.post("/api/nodes/node-a/control", json={"gate_load": False})
+    await client.post("/api/nodes/node-b/control", json={"gate_load": False})
+    ok_ids = [r.json()["id"] for r in results if r.status_code == 201]
+    for dep_id in ok_ids:
+        dep = await wait_for(client, dep_id, {"AVAILABLE"}, timeout=12)
+        assert all(x["status"] == "LOADED" for x in dep["replicas"])
+    book = (await client.get("/api/nodes")).json()
+    for n in book:
+        assert n["used_mb"] == 8000 and n["free_mb"] == 192
+

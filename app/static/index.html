@@ -148,6 +148,8 @@ function renderFaults(nodes){
       <button class="danger" onclick="setControl('${n.node_id}',{mode:'unreachable'})">模拟失联</button>
       <button class="ghost" onclick="setControl('${n.node_id}',{load_fail:true})">下次加载失败</button>
       <button class="ghost" onclick="setControl('${n.node_id}',{load_fail:false,ack_delay:4})">迟到回执4s</button>
+      <button class="warn" onclick="setControl('${n.node_id}',{gate_load:true})">挂起加载请求</button>
+      <button class="ghost" onclick="setControl('${n.node_id}',{gate_load:false})">放行加载请求</button>
       <button class="ghost" onclick="resetNode('${n.node_id}')">重置节点</button>
     </div>`).join('');
 }
@@ -171,6 +173,8 @@ function renderDeps(deps){
       ${esc(r.id)} · ${esc(r.node_name)} · epoch ${r.epoch} · ${badge(r.status_cn, REP_BADGE[r.status]||'secondary')}
       ${r.last_error?`<div class="reason">${esc(r.last_error)}</div>`:''}
     </div>`).join('');
+    const reserved = ['PENDING','LOADING','LOADED','TIMEOUT','UNVERIFIED','RELEASING'];
+    const canRevoke = d.replicas.some(r=>r.epoch===d.epoch && reserved.includes(r.status));
     return `<tr>
       <td><b>${esc(d.model_name)}</b><br><span class="muted">${esc(d.id)}<br>尝试 ${d.attempts} 次 · epoch ${d.epoch}</span></td>
       <td>${d.replica_count} 副本 × ${d.mem_per_replica_mb}MB</td>
@@ -181,6 +185,8 @@ function renderDeps(deps){
         </div></details></td>
       <td style="white-space:nowrap">
         <button onclick="act('${d.id}','reconcile')">手动对账</button>
+        <button class="danger" ${canRevoke?'':'disabled'} title="向节点建立撤销栅栏，确认无占用后才释放显存"
+          onclick="act('${d.id}','revoke')">撤销</button>
         <button class="warn" ${d.status!=='FAILED'?'disabled':''} onclick="act('${d.id}','retry')">重试</button>
       </td></tr>`;
   }).join('') || '<tr><td colspan="5" class="muted">暂无部署</td></tr>';

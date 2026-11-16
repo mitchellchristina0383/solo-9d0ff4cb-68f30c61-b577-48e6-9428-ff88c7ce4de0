@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS replicas (
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
     confirmed_at   TEXT,
-    released_at    TEXT
+    released_at    TEXT,
+    revoke_fenced_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_replicas_dep ON replicas(deployment_id);
 CREATE INDEX IF NOT EXISTS idx_replicas_node ON replicas(node_id);
@@ -59,6 +60,18 @@ CREATE TABLE IF NOT EXISTS events (
 );
 """
 
+# 旧版本库增量迁移：记录撤销栅栏建立时间（节点已受理 unload 后才允许对账释放）
+_MIGRATIONS = (
+    ("replicas", "revoke_fenced_at", "ALTER TABLE replicas ADD COLUMN revoke_fenced_at TEXT"),
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(replicas)").fetchall()}
+    for _table, col, ddl in _MIGRATIONS:
+        if col not in cols:
+            conn.execute(ddl)
+
 
 def connect() -> sqlite3.Connection:
     global _conn
@@ -70,6 +83,8 @@ def connect() -> sqlite3.Connection:
         _conn.execute("PRAGMA foreign_keys=ON")
         _conn.execute("PRAGMA busy_timeout=30000")
         _conn.executescript(SCHEMA)
+        _migrate(_conn)
+        _conn.commit()
     return _conn
 
 
